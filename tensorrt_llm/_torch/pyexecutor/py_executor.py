@@ -1062,6 +1062,24 @@ class PyExecutor:
 
         return req_stats
 
+    @staticmethod
+    def _get_num_context_tokens_for_stats(
+            scheduled_batch: ScheduledRequests) -> int:
+        num_ctx_tokens = 0
+        for req in scheduled_batch.context_requests:
+            last_chunk = getattr(req, "py_last_context_chunk", None)
+            if (last_chunk is not None and last_chunk[0] is not None
+                    and last_chunk[1] is not None):
+                start, end = last_chunk
+                num_ctx_tokens += max(0, end - start)
+                continue
+
+            try:
+                num_ctx_tokens += req.context_chunk_size
+            except RuntimeError:
+                pass
+        return num_ctx_tokens
+
     def _update_iter_stats(self, stats, iter_latency_ms, num_completed_requests,
                            scheduled_batch, micro_batch_id) -> IterationStats:
         stats.iter_latency_ms = iter_latency_ms
@@ -1094,13 +1112,20 @@ class PyExecutor:
             kv_stats_to_save.cache_hit_rate = kv_stats.cache_hit_rate
             stats.kv_cache_stats = kv_stats_to_save
 
-        stats.inflight_batching_stats.num_context_requests = scheduled_batch.num_context_requests
-        stats.inflight_batching_stats.num_gen_requests = scheduled_batch.num_generation_requests
-        stats.inflight_batching_stats.num_scheduled_requests = stats.inflight_batching_stats.num_context_requests + stats.inflight_batching_stats.num_gen_requests
-        stats.inflight_batching_stats.num_paused_requests = len(
-            scheduled_batch.paused_requests)
-        stats.inflight_batching_stats.avg_num_decoded_tokens_per_iter = 0
-        stats.inflight_batching_stats.micro_batch_id = micro_batch_id
+        ifb_stats = stats.inflight_batching_stats
+        ifb_stats.num_context_requests = scheduled_batch.num_context_requests
+        ifb_stats.num_gen_requests = scheduled_batch.num_generation_requests
+        ifb_stats.num_scheduled_requests = (
+            ifb_stats.num_context_requests + ifb_stats.num_gen_requests)
+        ifb_stats.num_paused_requests = len(scheduled_batch.paused_requests)
+        ifb_stats.num_ctx_tokens = self._get_num_context_tokens_for_stats(
+            scheduled_batch)
+        ifb_stats.avg_num_decoded_tokens_per_iter = 0
+        ifb_stats.micro_batch_id = micro_batch_id
+        self.model_engine.iter_states.update({
+            'num_ctx_requests': ifb_stats.num_context_requests,
+            'num_ctx_tokens': ifb_stats.num_ctx_tokens,
+        })
 
         if stats.specdec_stats is not None:
             total_draft_tokens = 0
@@ -1454,9 +1479,6 @@ class PyExecutor:
                                 self._update_generation_requests_that_will_complete_next_iteration(
                                     scheduled_batch.generation_requests)
 
-                    if self.enable_iter_perf_stats:
-                        iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
-                            'num_ctx_tokens']
                     batch_state = BatchStatePP(
                         scheduled_requests=scheduled_batch,
                         sample_state=sample_state,
@@ -2083,8 +2105,6 @@ class PyExecutor:
                 self._kv_connector_terminate_requests()
 
                 if self.enable_iter_perf_stats and sample_state is not None:
-                    iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
-                        'num_ctx_tokens']
                     self._process_iter_stats(
                         finished_requests, self.active_requests,
                         BatchState(scheduled_requests=scheduled_batch,
@@ -2377,10 +2397,6 @@ class PyExecutor:
                         gpu_forward_end, gpu_sample_end, fwd_timing.start_time,
                         fwd_timing.end_time, sample_timing.start_time,
                         sample_timing.end_time)
-                    if self.enable_iter_perf_stats:
-                        iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
-                            'num_ctx_tokens']
-
                     self.previous_batch = BatchState(
                         scheduled_requests=scheduled_batch,
                         sample_state=sample_state,
